@@ -7,8 +7,23 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { useAuth } from '@/hooks/useAuth';
 import { useToast } from '@/hooks/use-toast';
 import logo from '@/assets/logo.png';
-import { Eye, EyeOff } from 'lucide-react';
+import { Eye, EyeOff, AlertTriangle } from 'lucide-react';
 import { supabase } from '@/integrations/supabase/client';
+
+/** Helper: detect if an error is a network/timeout issue. */
+function isNetworkError(err: any): boolean {
+  if (!err) return false;
+  const msg = (err.message || err.toString()).toLowerCase();
+  return (
+    msg.includes('timed out') ||
+    msg.includes('failed to fetch') ||
+    msg.includes('network') ||
+    msg.includes('load failed') ||
+    msg.includes('err_connection') ||
+    err.name === 'NetworkError' ||
+    err.name === 'AbortError'
+  );
+}
 
 export function SignIn() {
   const [storeData, setStoreData] = useState({ franchiseId: '', password: '' });
@@ -16,26 +31,43 @@ export function SignIn() {
   const [loading, setLoading] = useState(false);
   const [showStorePassword, setShowStorePassword] = useState(false);
   const [showAdminPassword, setShowAdminPassword] = useState(false);
-  const { signIn } = useAuth();
+  const { signIn, connectionError } = useAuth();
   const { toast } = useToast();
+
+  const showNetworkErrorToast = () => {
+    toast({
+      title: "Connection Failed",
+      description: "Cannot connect to server. Please check your internet connection and try again.",
+      variant: "destructive",
+    });
+  };
 
   const handleStoreLogin = async (e: React.FormEvent) => {
     e.preventDefault();
     setLoading(true);
-    
+
     const rawId = storeData.franchiseId.toLowerCase().trim();
     const normalizedId = rawId.startsWith('fr-') ? rawId : `fr-${rawId}`;
     const constructedEmail = `store.${normalizedId}@yourdomain.com`;
-    
+
     console.log("[DEBUG] Store Attempt:", { normalizedId, constructedEmail });
 
     try {
       // Search DB for the franchise_id
-      const { data: profile } = await supabase
+      const { data: profile, error: queryError } = await supabase
         .from('profiles')
         .select('id')
         .eq('franchise_id', normalizedId.toUpperCase())
         .maybeSingle();
+
+      if (queryError) {
+        if (isNetworkError(queryError)) {
+          showNetworkErrorToast();
+          setLoading(false);
+          return;
+        }
+        console.error("[DEBUG] Profile query error:", queryError);
+      }
 
       if (!profile) {
         toast({
@@ -49,10 +81,19 @@ export function SignIn() {
 
       const { error: loginError } = await signIn(constructedEmail, storeData.password);
       if (loginError) {
-        toast({ title: "Wrong Password", description: "Incorrect password for this store.", variant: "destructive" });
+        if (isNetworkError(loginError)) {
+          showNetworkErrorToast();
+        } else {
+          toast({ title: "Wrong Password", description: "Incorrect password for this store.", variant: "destructive" });
+        }
       }
-    } catch (err) {
+    } catch (err: any) {
       console.error(err);
+      if (isNetworkError(err)) {
+        showNetworkErrorToast();
+      } else {
+        toast({ title: "Error", description: "An unexpected error occurred. Please try again.", variant: "destructive" });
+      }
     } finally {
       setLoading(false);
     }
@@ -61,17 +102,17 @@ export function SignIn() {
   const handleAdminLogin = async (e: React.FormEvent) => {
     e.preventDefault();
     setLoading(true);
-    
+
     // 1. Normalize Franchise ID (e.g. 0003 -> FR-0003)
     const rawId = adminData.franchiseId.toLowerCase().trim();
     const normalizedId = rawId.startsWith('fr-') ? rawId : `fr-${rawId}`;
     const dbFranchiseId = normalizedId.toUpperCase();
-    
+
     // 2. Extract Prefix and Build Auth Email
     const typedEmail = adminData.emailInput.toLowerCase().trim();
     const prefix = typedEmail.split('@')[0];
     const authEmail = `${prefix}+${normalizedId}@gmail.com`;
-    
+
     console.log("[DEBUG] Admin Logic Trace:", {
       searchDbFor: typedEmail,
       authWith: authEmail,
@@ -87,7 +128,14 @@ export function SignIn() {
         .eq('franchise_id', dbFranchiseId)
         .maybeSingle();
 
-      if (dbError) console.error("[DEBUG] DB Check Error:", dbError);
+      if (dbError) {
+        console.error("[DEBUG] DB Check Error:", dbError);
+        if (isNetworkError(dbError)) {
+          showNetworkErrorToast();
+          setLoading(false);
+          return;
+        }
+      }
 
       if (!adminProfile) {
         toast({
@@ -101,16 +149,25 @@ export function SignIn() {
 
       // STEP B: Auth with the Plus email
       const { error: loginError } = await signIn(authEmail, adminData.password);
-      
+
       if (loginError) {
-        toast({ 
-          title: "Wrong Password", 
-          description: "Incorrect password for this Admin account.", 
-          variant: "destructive" 
-        });
+        if (isNetworkError(loginError)) {
+          showNetworkErrorToast();
+        } else {
+          toast({
+            title: "Wrong Password",
+            description: "Incorrect password for this Admin account.",
+            variant: "destructive"
+          });
+        }
       }
-    } catch (err) {
+    } catch (err: any) {
       console.error("[DEBUG] Fatal Admin Error:", err);
+      if (isNetworkError(err)) {
+        showNetworkErrorToast();
+      } else {
+        toast({ title: "Error", description: "An unexpected error occurred. Please try again.", variant: "destructive" });
+      }
     } finally {
       setLoading(false);
     }
@@ -127,13 +184,21 @@ export function SignIn() {
           <CardDescription>Secure Access Portal</CardDescription>
         </CardHeader>
 
+        {/* Connection error alert */}
+        {connectionError && (
+          <div className="mx-6 mb-2 p-3 rounded-lg bg-red-50 border border-red-200 flex items-center gap-2 text-sm text-red-700">
+            <AlertTriangle size={16} className="flex-shrink-0" />
+            <span>Server unreachable. Please check your internet connection.</span>
+          </div>
+        )}
+
         <CardContent>
           <Tabs defaultValue="store" className="w-full">
             <TabsList className="grid w-full grid-cols-2 bg-gray-100 mb-6 p-1 rounded-lg">
               <TabsTrigger value="store" className="data-[state=active]:bg-[rgb(0,100,55)] data-[state=active]:text-white transition-all">Store</TabsTrigger>
               <TabsTrigger value="admin" className="data-[state=active]:bg-[rgb(0,100,55)] data-[state=active]:text-white transition-all">Admin</TabsTrigger>
             </TabsList>
-            
+
             {/* Store Tab Content */}
             <TabsContent value="store">
               <form onSubmit={handleStoreLogin} className="space-y-4">
@@ -168,7 +233,7 @@ export function SignIn() {
                 </Button>
               </form>
             </TabsContent>
-            
+
             {/* Admin Tab Content */}
             <TabsContent value="admin">
               <form onSubmit={handleAdminLogin} className="space-y-4">

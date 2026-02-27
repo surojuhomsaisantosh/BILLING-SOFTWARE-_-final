@@ -10,11 +10,28 @@ interface AuthContextType {
   role: UserRole | null;
   franchiseId: string | null;
   loading: boolean;
+  connectionError: boolean;
   signIn: (email: string, password: string) => Promise<{ error: any }>;
   signOut: () => Promise<void>;
 }
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
+
+// Timeout for session initialization (10 seconds)
+const SESSION_TIMEOUT_MS = 10_000;
+
+/** Race a promise against a timeout. */
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new Error(`${label} timed out after ${ms}ms`)),
+      ms
+    );
+    promise
+      .then((val) => { clearTimeout(timer); resolve(val); })
+      .catch((err) => { clearTimeout(timer); reject(err); });
+  });
+}
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [user, setUser] = useState<User | null>(null);
@@ -22,27 +39,28 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [role, setRole] = useState<UserRole | null>(null);
   const [franchiseId, setFranchiseId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const [connectionError, setConnectionError] = useState(false);
 
   const detectRoleFromEmail = (email: string): { role: UserRole; franchiseId: string } => {
     console.log('Detecting role from email:', email);
-    
+
     if (email.startsWith('store.')) {
-      const franchise = email.split('.')[1].split('@')[0].toUpperCase(); // Convert to uppercase to match database
+      const franchise = email.split('.')[1].split('@')[0].toUpperCase();
       console.log('Detected store account with franchise ID:', franchise);
       return { role: 'store', franchiseId: franchise };
     }
-    
+
     if (email.toLowerCase().includes('+fr-central')) {
       console.log('Detected FR-CENTRAL account');
-      return { role: 'central', franchiseId: 'FR-CENTRAL' }; // Use uppercase to match database
+      return { role: 'central', franchiseId: 'FR-CENTRAL' };
     }
-    
+
     if (email.includes('+')) {
-      const franchise = email.split('+')[1].split('@')[0].toUpperCase(); // Convert to uppercase to match database
+      const franchise = email.split('+')[1].split('@')[0].toUpperCase();
       console.log('Detected admin account with franchise ID:', franchise);
       return { role: 'admin', franchiseId: franchise };
     }
-    
+
     console.log('Could not detect role from email, defaulting to store');
     return { role: 'store', franchiseId: 'unknown' };
   };
@@ -51,7 +69,10 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     const { data: { subscription } } = supabase.auth.onAuthStateChange(
       (event, session) => {
         console.log('Auth state change:', event, session);
-        
+
+        // Connection is working if we get auth state events
+        setConnectionError(false);
+
         // Handle session expiry or invalid refresh token
         if (event === 'TOKEN_REFRESHED' && !session) {
           console.log('Token refresh failed, clearing session');
@@ -62,7 +83,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           setLoading(false);
           return;
         }
-        
+
         if (event === 'SIGNED_OUT' || !session) {
           console.log('User signed out or no session');
           setSession(null);
@@ -72,11 +93,11 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           setLoading(false);
           return;
         }
-        
+
         // Valid session
         setSession(session);
         setUser(session.user);
-        
+
         if (session.user?.email) {
           const { role: userRole, franchiseId: userFranchiseId } = detectRoleFromEmail(session.user.email);
           setRole(userRole);
@@ -89,39 +110,65 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       }
     );
 
-    // Check for existing session
-    supabase.auth.getSession().then(({ data: { session }, error }) => {
-      if (error) {
-        console.error('Session error:', error);
-        // Clear any invalid session
+    // Check for existing session WITH timeout
+    withTimeout(
+      supabase.auth.getSession(),
+      SESSION_TIMEOUT_MS,
+      'Session check'
+    )
+      .then(({ data: { session }, error }) => {
+        if (error) {
+          console.error('Session error:', error);
+          setSession(null);
+          setUser(null);
+          setRole(null);
+          setFranchiseId(null);
+          setLoading(false);
+          return;
+        }
+
+        setSession(session);
+        setUser(session?.user ?? null);
+
+        if (session?.user?.email) {
+          const { role: userRole, franchiseId: userFranchiseId } = detectRoleFromEmail(session.user.email);
+          setRole(userRole);
+          setFranchiseId(userFranchiseId);
+        }
+        setLoading(false);
+      })
+      .catch((err) => {
+        console.warn('Session initialization failed (likely network issue):', err.message);
+        setConnectionError(true);
         setSession(null);
         setUser(null);
         setRole(null);
         setFranchiseId(null);
         setLoading(false);
-        return;
-      }
-      
-      setSession(session);
-      setUser(session?.user ?? null);
-      
-      if (session?.user?.email) {
-        const { role: userRole, franchiseId: userFranchiseId } = detectRoleFromEmail(session.user.email);
-        setRole(userRole);
-        setFranchiseId(userFranchiseId);
-      }
-      setLoading(false);
-    });
+      });
 
     return () => subscription.unsubscribe();
   }, []);
 
   const signIn = async (email: string, password: string) => {
-    const { error } = await supabase.auth.signInWithPassword({
-      email,
-      password,
-    });
-    return { error };
+    try {
+      const { error } = await supabase.auth.signInWithPassword({
+        email,
+        password,
+      });
+      if (!error) setConnectionError(false);
+      return { error };
+    } catch (err: any) {
+      setConnectionError(true);
+      return {
+        error: {
+          message: err.message?.includes('timed out')
+            ? 'Connection timed out. Please check your internet connection and try again.'
+            : 'Cannot connect to server. Please check your internet connection.',
+          name: 'NetworkError',
+        },
+      };
+    }
   };
 
   const signOut = async () => {
@@ -148,6 +195,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       role,
       franchiseId,
       loading,
+      connectionError,
       signIn,
       signOut,
     }}>
